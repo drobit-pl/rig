@@ -7,6 +7,11 @@ a pong frame, and can inject faults:
 * seq gaps    (--gap-every N: skip --gap-len seq values every Nth frame)
 * mid-stream reset (--reset-after S: emit garbage, restart with seq=0 and
   session=0, keep streaming — models firmware that resumes after a watchdog)
+* boot delay  (--boot-delay S: after (simulated) open/reset, drop ALL input
+  for S seconds — the chip is still booting and not listening, so any START
+  sent then is lost — then emit a status frame to announce readiness and only
+  afterwards accept START. Models the DTR/RTS-pulse reset that the real START
+  handshake has to survive.)
 
 Usable as a library (integration tests) or standalone for desk testing:
 
@@ -45,6 +50,8 @@ class FakeEsp:
         gap_every: int = 0,
         gap_len: int = 3,
         reset_after_s: float | None = None,
+        boot_delay_s: float | None = None,
+        emit_boot_status: bool = True,
         raw_fn: Callable[[int], int] = _default_raw,
     ) -> None:
         self._rate_hz = rate_hz
@@ -52,6 +59,10 @@ class FakeEsp:
         self._gap_every = gap_every
         self._gap_len = gap_len
         self._reset_after_s = reset_after_s
+        self._boot_delay_s = boot_delay_s
+        # If False the boot completes silently (status frame lost too), so only
+        # the reader's periodic START retransmit can recover the session.
+        self._emit_boot_status = emit_boot_status
         self._raw_fn = raw_fn
 
         self._master_fd = -1
@@ -63,6 +74,9 @@ class FakeEsp:
         self.crc_corrupted = 0
         self.gaps_injected = 0
         self.resets_done = 0
+        self.starts_received = 0  # STARTs accepted (after boot)
+        self.starts_discarded_booting = 0  # STARTs dropped while booting
+        self.status_frames_emitted = 0
 
     def start(self) -> str:
         """Open the pty and start the emitter thread; returns the slave path."""
@@ -118,10 +132,13 @@ class FakeEsp:
         self._write(bytes(data))
         self.frames_emitted += 1
 
+    # States: "booting" (chip not listening, input dropped), "idle" (waiting
+    # for START), "streaming" (emitting samples).
+    _BOOTING, _IDLE, _STREAMING = "booting", "idle", "streaming"
+
     def _run(self) -> None:
         session = 0
         seq = 0
-        streaming = False
         cmd_buf = bytearray()
         t0 = time.monotonic()
         next_frame_at = time.monotonic()
@@ -130,32 +147,70 @@ class FakeEsp:
             if self._reset_after_s is not None else None
         )
 
-        while not self._stop.is_set():
-            for cmd in self._read_commands(cmd_buf):
-                if cmd.startswith("START "):
-                    try:
-                        session = int(cmd.split()[1])
-                    except (IndexError, ValueError):
-                        continue
-                    seq = 0
-                    streaming = True
-                    next_frame_at = time.monotonic()
-                elif cmd == "STOP":
-                    streaming = False
-                elif cmd == "PING":
-                    esp_us = int((time.monotonic() - t0) * 1e6)
-                    self._emit(FrameType.PONG, session, seq, esp_us, 0)
-                    seq += 1
+        if self._boot_delay_s:
+            state = self._BOOTING
+            boot_until = t0 + self._boot_delay_s
+        else:
+            state = self._IDLE
+            boot_until = 0.0
 
-            if reset_at is not None and time.monotonic() >= reset_at:
+        while not self._stop.is_set():
+            cmds = self._read_commands(cmd_buf)
+
+            if state == self._BOOTING:
+                # Still booting: not listening yet. Drain and drop input (a
+                # real UART discards bytes sent to a chip that is resetting),
+                # counting any START the host wastes on us.
+                for cmd in cmds:
+                    if cmd.startswith("START "):
+                        self.starts_discarded_booting += 1
+                if time.monotonic() >= boot_until:
+                    # Boot done: announce readiness (unless that frame is also
+                    # "lost"), then wait for START.
+                    if self._emit_boot_status:
+                        esp_us = int((time.monotonic() - t0) * 1e6)
+                        self._emit(FrameType.STATUS, 0, 0, esp_us, 0)
+                        self.status_frames_emitted += 1
+                    state = self._IDLE
+                else:
+                    time.sleep(0.005)
+                    continue
+            else:
+                for cmd in cmds:
+                    if cmd.startswith("START "):
+                        try:
+                            session = int(cmd.split()[1])
+                        except (IndexError, ValueError):
+                            continue
+                        seq = 0
+                        state = self._STREAMING
+                        self.starts_received += 1
+                        next_frame_at = time.monotonic()
+                    elif cmd == "STOP":
+                        state = self._IDLE
+                    elif cmd == "PING":
+                        esp_us = int((time.monotonic() - t0) * 1e6)
+                        self._emit(FrameType.PONG, session, seq, esp_us, 0)
+                        seq += 1
+
+            if (
+                reset_at is not None
+                and time.monotonic() >= reset_at
+                and state == self._STREAMING
+            ):
                 # Watchdog "reboot": spew garbage, lose session, seq restarts.
                 self._write(GARBAGE_ON_RESET)
                 session = 0
                 seq = 0
                 self.resets_done += 1
                 reset_at = None
+                if self._boot_delay_s:
+                    # Realistic: the chip reboots and must be re-STARTed.
+                    state = self._BOOTING
+                    boot_until = time.monotonic() + self._boot_delay_s
+                # else: legacy behaviour - keep streaming as session 0.
 
-            if not streaming:
+            if state != self._STREAMING:
                 time.sleep(0.005)
                 continue
 
@@ -187,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gap-every", type=int, default=0)
     ap.add_argument("--gap-len", type=int, default=3)
     ap.add_argument("--reset-after", type=float, default=None)
+    ap.add_argument("--boot-delay", type=float, default=None)
     args = ap.parse_args(argv)
 
     esp = FakeEsp(
@@ -195,6 +251,7 @@ def main(argv: list[str] | None = None) -> int:
         gap_every=args.gap_every,
         gap_len=args.gap_len,
         reset_after_s=args.reset_after,
+        boot_delay_s=args.boot_delay,
     )
     path = esp.start()
     print(f"fake ESP on {path}  (ctrl-c to quit)")

@@ -1,8 +1,18 @@
 """Serial reader for the ESP32 scale head.
 
-Owns the serial port for the whole session: sends START on connect, tags every
-valid frame with CLOCK_MONOTONIC, detects seq gaps / ESP resets, and appends
-samples to <session_dir>/scale.parquet in one row group per flush.
+Owns the serial port for the whole session: runs a START handshake until the
+ESP is streaming, tags every valid frame with CLOCK_MONOTONIC, detects seq
+gaps / ESP resets, and appends samples to <session_dir>/scale.parquet in one
+row group per flush.
+
+Opening the port on a CP210x/CH340 bridge can pulse DTR/RTS and reset the
+ESP32 despite dsrdtr=False, so a single fire-and-forget START is easily lost
+during the ~1-2 s boot. Instead of sending START once, the reader keeps
+(re)sending it until a valid sample frame with our session id arrives, and
+also re-sends immediately whenever the ESP signals it is idle (a status frame,
+a seq reset, or frames tagged with the wrong session id). See _handle_frame /
+_send_start for the single "ensure started" mechanism the retransmit,
+reset-recovery, and stale-session paths all share.
 
 Runs standalone:  python -m drobit_rig.scale_reader --session-dir ... --session-id ...
 """
@@ -104,7 +114,8 @@ class ScaleReader:
         flush_interval_s: float = 60.0,
         status_interval_s: float = 5.0,
         read_timeout_s: float = 0.2,
-        start_resend_cooldown_s: float = 5.0,
+        start_retransmit_interval_s: float = 2.0,
+        start_warn_after_s: float = 30.0,
     ) -> None:
         self._port = port
         self._baud = baud
@@ -113,17 +124,28 @@ class ScaleReader:
         self._flush_interval_s = flush_interval_s
         self._status_interval_s = status_interval_s
         self._read_timeout_s = read_timeout_s
-        self._start_resend_cooldown_s = start_resend_cooldown_s
+        # How often to (re)send START while we are not yet streaming, and how
+        # long to wait before warning that the handshake still hasn't landed.
+        self._start_retransmit_interval_s = start_retransmit_interval_s
+        self._start_warn_after_s = start_warn_after_s
 
         self._parser = protocol.FrameParser()
         self._expected_seq: int | None = None
-        self._last_start_resend = float("-inf")
+        # Handshake state. _started flips True once a sample frame carrying our
+        # session id arrives; until then (and again after a reset) the run loop
+        # keeps retransmitting START. _last_start_send throttles every START
+        # sender so the reset/stale-session paths can't spam the ESP.
+        self._started = False
+        self._last_start_send = float("-inf")
+        self._handshake_start = 0.0
+        self._handshake_warned = False
 
         self.samples = 0
         self.missing_samples = 0
         self.gap_events = 0
         self.resets = 0
         self.serial_reconnects = 0
+        self.start_sends = 0
 
     # -- serial ----------------------------------------------------------
 
@@ -149,7 +171,9 @@ class ScaleReader:
         """Retry open until it succeeds or we are told to stop.
 
         The device may enumerate late (boot autostart) or drop out mid-run;
-        keep trying with capped backoff rather than crashing the session.
+        keep trying with capped backoff rather than crashing the session. On
+        success we begin a fresh handshake and fire the first START; the run
+        loop keeps retransmitting until the ESP actually streams.
         """
         delay = 1.0
         while not stop.is_set():
@@ -161,20 +185,53 @@ class ScaleReader:
                 delay = min(delay * 2, 30.0)
                 continue
             _LOG.info("opened %s @ %d baud", self._port, self._baud)
-            try:
-                ser.write(protocol.build_start(self._session_id))
-                ser.flush()
-            except (serial.SerialException, OSError) as exc:
-                _LOG.warning("port dropped while sending START: %s", exc)
+            self._begin_handshake()
+            if not self._send_start(ser, "initial", force=True):
+                # force=True bypasses the throttle, so a False here is a write
+                # error: the port dropped between open and the first START.
+                _LOG.warning("port dropped while sending initial START; reopening")
                 try:
                     ser.close()
                 except Exception:
                     pass
                 stop.wait(delay)
                 continue
-            _LOG.info("sent START %d", self._session_id)
             return ser
         return None
+
+    # -- START handshake ---------------------------------------------------
+
+    def _begin_handshake(self) -> None:
+        """(Re)enter the "not yet streaming" state and restart the warn clock.
+
+        Called on (re)connect and whenever the ESP tells us it reset, so the
+        run loop resumes retransmitting START and the 30 s warning measures
+        from this fresh attempt.
+        """
+        self._started = False
+        self._handshake_start = time.monotonic()
+        self._handshake_warned = False
+
+    def _send_start(self, ser: serial.Serial, reason: str, *, force: bool = False) -> bool:
+        """(Re)send ``START <session_id>``; return True iff it was written.
+
+        Throttled to the retransmit interval so the reset/stale-session paths
+        can fire freely without flooding the ESP. ``force`` skips the throttle
+        for events that mean "start now" (initial open, a status frame).
+        """
+        now = time.monotonic()
+        if not force and now - self._last_start_send < self._start_retransmit_interval_s:
+            return False
+        try:
+            ser.write(protocol.build_start(self._session_id))
+            ser.flush()
+        except (serial.SerialException, OSError) as exc:
+            _LOG.error("failed to send START (%s): %s", reason, exc)
+            return False
+        self._last_start_send = now
+        self.start_sends += 1
+        _LOG.info("sent START %d (%s)", self._session_id, reason)
+        return True
 
     # -- frame handling ----------------------------------------------------
 
@@ -182,32 +239,80 @@ class ScaleReader:
         gaps_file.write(json.dumps(record) + "\n")
         gaps_file.flush()
 
+    def _note_wrong_session(
+        self, frame: protocol.Frame, now_ns: int, gaps_file: IO[str], ser: serial.Serial,
+    ) -> None:
+        """Handle a frame carrying someone else's session id.
+
+        Means the ESP is not (yet) running our session: our START was lost
+        during its boot, or a previous run's session is still streaming. Re-arm
+        it; a foreign seq space is meaningless against ours, so this is never
+        counted as a gap. We only log/record when a START actually goes out
+        (throttled) so a burst of stale frames can't spam the gaps log.
+        """
+        self._started = False
+        if self._send_start(ser, "wrong session %d" % frame.session):
+            _LOG.warning(
+                "frame with wrong session %d (want %d, seq=%d): stale session, "
+                "re-sent START", frame.session, self._session_id, frame.seq,
+            )
+            self._record_gap(gaps_file, {
+                "kind": "wrong_session",
+                "rpi_mono_ns": now_ns,
+                "got_session": frame.session,
+                "got_seq": frame.seq,
+            })
+
     def _handle_frame(
         self, frame: protocol.Frame, now_ns: int, sink: ParquetSink,
         gaps_file: IO[str], ser: serial.Serial,
     ) -> None:
+        # A status frame means the ESP is idle: freshly booted (its DTR/RTS-
+        # pulse reset ate our first START) or just watchdog-reset. Take it as
+        # the cue to (re)send START now instead of waiting for the next
+        # retransmit tick, and treat ourselves as un-started again.
+        if frame.type is protocol.FrameType.STATUS:
+            _LOG.info("STATUS frame (seq=%d): ESP idle, (re)sending START", frame.seq)
+            self._begin_handshake()
+            # The status frame is itself the reset signal; the next stream will
+            # restart at seq 0 after our START. Drop the stale baseline so that
+            # fresh seq 0 is not mis-recorded as a backwards "reset".
+            self._expected_seq = None
+            self._send_start(ser, "status frame", force=True)
+            return
+
+        wrong_session = frame.session != self._session_id
+
         # seq increments per frame regardless of type, so gap tracking covers
-        # pong/status frames too even though only samples are stored.
+        # pong frames too even though only samples are stored.
         if self._expected_seq is not None and frame.seq != self._expected_seq:
             if frame.seq > self._expected_seq:
-                missing = frame.seq - self._expected_seq
-                self.missing_samples += missing
-                self.gap_events += 1
-                _LOG.warning(
-                    "seq gap: expected %d got %d (%d missing)",
-                    self._expected_seq, frame.seq, missing,
-                )
-                self._record_gap(gaps_file, {
-                    "kind": "gap",
-                    "rpi_mono_ns": now_ns,
-                    "expected_seq": self._expected_seq,
-                    "got_seq": frame.seq,
-                    "missing": missing,
-                })
+                if wrong_session:
+                    # A forward jump in a foreign session's seq space is not a
+                    # gap in our stream - it's a stale session. Re-arm without
+                    # recording a phantom gap.
+                    self._note_wrong_session(frame, now_ns, gaps_file, ser)
+                else:
+                    missing = frame.seq - self._expected_seq
+                    self.missing_samples += missing
+                    self.gap_events += 1
+                    _LOG.warning(
+                        "seq gap: expected %d got %d (%d missing)",
+                        self._expected_seq, frame.seq, missing,
+                    )
+                    self._record_gap(gaps_file, {
+                        "kind": "gap",
+                        "rpi_mono_ns": now_ns,
+                        "expected_seq": self._expected_seq,
+                        "got_seq": frame.seq,
+                        "missing": missing,
+                    })
             else:
                 # seq went backwards: ESP reset (brown-out, watchdog, DTR
-                # glitch) or a duplicate START. Log, record, keep going.
+                # glitch) or a duplicate START. Log, record, re-enter the
+                # handshake, keep going.
                 self.resets += 1
+                self._begin_handshake()
                 _LOG.warning(
                     "seq went backwards (expected %d, got %d) - ESP reset? "
                     "session=%d", self._expected_seq, frame.seq, frame.session,
@@ -219,23 +324,24 @@ class ScaleReader:
                     "got_seq": frame.seq,
                     "missing": None,
                 })
-                if (
-                    frame.session != self._session_id
-                    and time.monotonic() - self._last_start_resend
-                    > self._start_resend_cooldown_s
-                ):
-                    # The ESP lost the session id in the reset; re-arm it so
-                    # subsequent rows are tagged with the right session.
-                    _LOG.warning("re-sending START %d after reset", self._session_id)
-                    try:
-                        ser.write(protocol.build_start(self._session_id))
-                        ser.flush()
-                    except (serial.SerialException, OSError) as exc:
-                        _LOG.error("failed to re-send START: %s", exc)
-                    self._last_start_resend = time.monotonic()
+                if wrong_session:
+                    # The reset dropped our session id; re-arm it (throttled)
+                    # so subsequent rows are tagged with the right session.
+                    self._send_start(ser, "reset")
+        elif wrong_session:
+            # First frame after (re)connect, or a contiguous frame, but from
+            # the wrong session: re-arm without counting a gap.
+            self._note_wrong_session(frame, now_ns, gaps_file, ser)
+
         self._expected_seq = (frame.seq + 1) & protocol.U32_MAX
 
         if frame.type is protocol.FrameType.SAMPLE:
+            if not wrong_session and not self._started:
+                _LOG.info(
+                    "handshake complete: streaming session %d (seq=%d)",
+                    self._session_id, frame.seq,
+                )
+                self._started = True
             sink.append(frame.session, frame.seq, frame.esp_us, now_ns, frame.raw)
             self.samples += 1
         else:
@@ -246,6 +352,8 @@ class ScaleReader:
     def _write_status(self, sink: ParquetSink, connected: bool) -> None:
         status = {
             "session_id": self._session_id,
+            "started": self._started,
+            "start_sends": self.start_sends,
             "samples": self.samples,
             "missing_samples": self.missing_samples,
             "gap_events": self.gap_events,
@@ -298,6 +406,22 @@ class ScaleReader:
                                 frame, mono_ns(), sink, gaps_file, ser
                             )
                     now = time.monotonic()
+                    # START handshake: keep retransmitting until we are
+                    # streaming, then stop. A status frame or reset can drop us
+                    # back into this state mid-run, which is the whole point.
+                    if not self._started:
+                        if now - self._last_start_send >= self._start_retransmit_interval_s:
+                            self._send_start(ser, "retransmit")
+                        if (
+                            not self._handshake_warned
+                            and now - self._handshake_start >= self._start_warn_after_s
+                        ):
+                            _LOG.warning(
+                                "no valid stream %.0fs after opening %s "
+                                "(session=%d); still retransmitting START",
+                                self._start_warn_after_s, self._port, self._session_id,
+                            )
+                            self._handshake_warned = True
                     if now - last_flush >= self._flush_interval_s:
                         n = sink.flush()
                         last_flush = now
@@ -336,6 +460,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--session-dir", type=Path, required=True)
     ap.add_argument("--flush-interval", type=float, default=60.0)
     ap.add_argument("--status-interval", type=float, default=5.0)
+    ap.add_argument("--start-retransmit-interval", type=float, default=2.0)
+    ap.add_argument("--start-warn-after", type=float, default=30.0)
     args = ap.parse_args(argv)
 
     setup_logging("scale_reader", args.session_dir)
@@ -355,6 +481,8 @@ def main(argv: list[str] | None = None) -> int:
         session_dir=args.session_dir,
         flush_interval_s=args.flush_interval,
         status_interval_s=args.status_interval,
+        start_retransmit_interval_s=args.start_retransmit_interval,
+        start_warn_after_s=args.start_warn_after,
     )
     return reader.run(stop)
 
