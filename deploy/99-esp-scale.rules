@@ -15,9 +15,3 @@
 
 # Silicon Labs CP2102/CP2104 (most common "USB to UART bridge" ESP32 dev boards)
 SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="esp-scale"
-
-# QinHeng CH340/CH341 (cheap clone boards)
-SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="esp-scale"
-
-# Espressif native USB-Serial/JTAG (ESP32-S3/C3/C6 with direct USB, /dev/ttyACM*)
-SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", SYMLINK+="esp-scale"
