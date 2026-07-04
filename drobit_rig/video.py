@@ -1,12 +1,13 @@
 """rpicam-vid supervisor: segmented H.264 recording + monotonic segment index.
 
-Wraps rpicam-vid as a subprocess (1280x720 @ 20 fps by default, hardware
-H.264, --segment). Flags are probed from ``rpicam-vid --help`` at runtime
-because rpicam-apps flag names/capabilities differ across builds:
-
-* if the build lists libav support we write .mp4 segments,
-* otherwise raw .h264 segments (with --inline so every segment is decodable)
-  plus --save-pts timestamps when available.
+Wraps rpicam-vid as a subprocess (1280x720 @ 20 fps by default, --segment).
+Flags are probed from ``rpicam-vid --help`` at runtime because rpicam-apps
+flag names differ across builds. Output is always raw .h264 segments —
+--inline (when available) makes every segment independently decodable and
+--save-pts (when available) records per-frame timestamps. Container output
+(.mp4) is deliberately not used: rpicam-apps' libav encoder — the only
+encoder on Pi 5 — rejects --segment/--save-pts with non-elementary streams
+("Incompatible options selected").
 
 Timestamping model
 ------------------
@@ -198,21 +199,20 @@ class VideoRecorder:
 
     # -- probing ------------------------------------------------------------
 
-    def _probe(self) -> tuple[frozenset[str], str]:
-        """Return (supported long flags, full help text) from --help."""
+    def _probe(self) -> frozenset[str]:
+        """Return the long flags advertised by --help."""
         result = subprocess.run(
             [self._binary, "--help"], capture_output=True, text=True, timeout=15
         )
         help_text = result.stdout + result.stderr
-        flags = frozenset(re.findall(r"--([A-Za-z0-9][A-Za-z0-9-]*)", help_text))
-        return flags, help_text
+        return frozenset(re.findall(r"--([A-Za-z0-9][A-Za-z0-9-]*)", help_text))
 
     def _build_command(
-        self, flags: frozenset[str], help_text: str, prefix: str
+        self, flags: frozenset[str], prefix: str
     ) -> tuple[list[str], Path | None]:
         """Build the rpicam-vid command line; returns (cmd, pts_path or None)."""
-        use_mp4 = "libav" in help_text  # libav backend muxes mp4 directly
-        ext = "mp4" if use_mp4 else "h264"
+        # Always elementary .h264: the libav encoder rejects --segment and
+        # --save-pts with container output (.mp4).
         cmd = [
             self._binary,
             "--timeout", "0",  # record until signalled
@@ -220,19 +220,16 @@ class VideoRecorder:
             "--height", str(self._height),
             "--framerate", str(self._fps),
             "--segment", str(self._segment_ms),
-            "--output", str(self._video_dir / f"{prefix}seg_%05d.{ext}"),
+            "--output", str(self._video_dir / f"{prefix}seg_%05d.h264"),
         ]
         if "nopreview" in flags:
             cmd.append("--nopreview")
+        if "inline" in flags:
+            cmd.append("--inline")  # SPS/PPS per I-frame: segments decodable
         pts_path: Path | None = None
-        if not use_mp4:
-            if "inline" in flags:
-                cmd.append("--inline")  # SPS/PPS per I-frame: segments decodable
-            if "save-pts" in flags:
-                # --save-pts is ignored/unsupported with the libav backend,
-                # so only used for raw h264 output.
-                pts_path = self._video_dir / f"{prefix}pts.txt"
-                cmd += ["--save-pts", str(pts_path)]
+        if "save-pts" in flags:
+            pts_path = self._video_dir / f"{prefix}pts.txt"
+            cmd += ["--save-pts", str(pts_path)]
         return cmd, pts_path
 
     # -- process management ---------------------------------------------------
@@ -273,7 +270,7 @@ class VideoRecorder:
 
     def run(self, stop: threading.Event) -> int:
         try:
-            flags, help_text = self._probe()
+            flags = self._probe()
         except FileNotFoundError:
             _LOG.error("%s not found - is rpicam-apps installed?", self._binary)
             return 2
@@ -291,7 +288,7 @@ class VideoRecorder:
         with open(self._session_dir / "video_index.jsonl", "a") as index_file:
             while not stop.is_set():
                 prefix = "" if gen == 0 else f"r{gen}_"
-                cmd, pts_path = self._build_command(flags, help_text, prefix)
+                cmd, pts_path = self._build_command(flags, prefix)
                 _LOG.info("starting: %s", " ".join(cmd))
                 rec_start_mono_ns = mono_ns()
                 run_started = time.monotonic()

@@ -64,7 +64,7 @@ Session directory layout:
 ├── scale.parquet       session, seq, esp_us, rpi_mono_ns, raw   (80 Hz)
 ├── gaps.jsonl          seq gaps and ESP resets
 ├── status.json         live counters (updated every 5 s)
-├── video/seg_00000.mp4|h264 ...   5-min segments
+├── video/seg_00000.h264 ...   5-min segments
 ├── video_index.jsonl   {seg, file, start_mono_ns, fps, source} per segment
 ├── events.jsonl        |signal−baseline| > threshold intervals (navigation aid)
 ├── logs/*.log          rotating logs per component
