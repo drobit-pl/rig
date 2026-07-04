@@ -1,0 +1,5 @@
+pyserial>=3.5
+pyarrow>=14
+
+[dev]
+pytest>=7

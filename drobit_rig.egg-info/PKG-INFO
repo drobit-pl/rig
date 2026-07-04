@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: drobit-rig
+Version: 0.1.0
+Summary: Raw data collection rig for poultry scale development (ESP32 load cell + Pi camera)
+Requires-Python: >=3.11
+Requires-Dist: pyserial>=3.5
+Requires-Dist: pyarrow>=14
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"

@@ -1,0 +1,2 @@
+[console_scripts]
+drobit-rig = drobit_rig.cli:main
