@@ -8,7 +8,7 @@ plus a directory under the data root:
         scale.parquet       80 Hz raw samples
         gaps.jsonl          seq gaps / ESP resets
         status.json         live counters from the scale reader
-        video/seg_*.mp4|h264, video_index.jsonl
+        video/seg_*.h264, video_index.jsonl
         events.jsonl        written by the post-session event scan
         logs/*.log
         done                marker: session was stopped cleanly

@@ -1,4 +1,6 @@
-__pycache__/
+/__pycache__/
+drobit_rig/__pycache__/
+tests/__pycache__/
 *.pyc
 .venv/
 venv/

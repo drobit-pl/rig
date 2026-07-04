@@ -84,17 +84,20 @@ def test_records_segments_and_index_h264(fake_binary, tmp_path):
         assert 300 < delta_ms < 900
 
 
-def test_mp4_mode_when_libav_advertised(fake_binary, tmp_path, monkeypatch):
+def test_h264_even_when_libav_advertised(fake_binary, tmp_path, monkeypatch):
+    # rpicam-apps' libav encoder (the only one on Pi 5) rejects --segment and
+    # --save-pts with .mp4 output, so libav in --help must NOT switch the
+    # recorder to mp4 segments.
     monkeypatch.setenv("FAKE_RPICAM_LIBAV", "1")
     session_dir = tmp_path / "sess"
     session_dir.mkdir()
     recorder = make_recorder(session_dir, fake_binary)
     assert run_recorder(recorder, run_s=1.5) == 0
 
-    assert list((session_dir / "video").glob("seg_*.mp4"))
-    assert not list((session_dir / "video").glob("*.pts")), "no --save-pts with libav"
+    assert list((session_dir / "video").glob("seg_*.h264"))
+    assert not list((session_dir / "video").glob("*.mp4"))
     index = read_index(session_dir)
-    assert index and all(e["source"] == "estimate" for e in index)
+    assert index and index[0]["source"] == "pts"
 
 
 def test_restart_on_death_with_new_prefix(fake_binary, tmp_path, monkeypatch):
