@@ -1,0 +1,34 @@
+# drobit-rig autostart unit for UNATTENDED FIELD DEPLOYMENTS ONLY.
+#
+# Normal development use is manual: `drobit-rig start` / `drobit-rig stop`.
+# This unit is intentionally NOT enabled by installing it — enable explicitly
+# when the rig ships to a site with nobody at the keyboard:
+#
+#   sudo cp deploy/drobit-rig-autostart.service /etc/systemd/system/
+#   # edit User= and the venv path below first
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable drobit-rig-autostart   # opt in
+#
+# Notes:
+# - BindsTo/After on the device unit delays start until /dev/esp-scale
+#   exists (udev tags tty devices for systemd automatically). The scale
+#   reader also retries opening the port itself, so this is belt+braces.
+# - Type=oneshot + RemainAfterExit: `drobit-rig start` spawns the two
+#   detached workers and exits; systemd keeps the unit "active" and runs
+#   `drobit-rig stop` (clean flush) on shutdown.
+
+[Unit]
+Description=drobit-rig data collection session (auto-start on boot)
+Wants=dev-esp\x2dscale.device
+After=dev-esp\x2dscale.device data.mount multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=pi
+ExecStart=/data/drobit-rig/venv/bin/drobit-rig start --note "autostart (boot)"
+ExecStop=/data/drobit-rig/venv/bin/drobit-rig stop
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
