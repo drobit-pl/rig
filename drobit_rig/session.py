@@ -83,6 +83,59 @@ def read_lock(root: Path) -> dict[str, Any] | None:
         return None
 
 
+def _active_session_dir(cfg: RigConfig) -> Path:
+    """Directory of the session currently being recorded, or raise. Used by the
+    operator-driven annotations (reference weights, calibration) that must land
+    in the running session so they align with scale.parquet by rpi_mono_ns."""
+    lock = read_lock(cfg.data_root)
+    if lock is None or not lock.get("session_dir"):
+        raise SessionError("no running session; run 'drobit-rig start' first")
+    return Path(lock["session_dir"])
+
+
+def mark_weight(
+    cfg: RigConfig, grams: float, note: str = "", bird_id: str = ""
+) -> Path:
+    """Log an independent ground-truth weight (from a manual/trusted scale) into
+    the running session as reference_weights.jsonl. This is the reference the
+    detector's estimates are measured and bias-corrected against — video labels
+    give counts, not true mass."""
+    session_dir = _active_session_dir(cfg)
+    record = {
+        "rpi_mono_ns": mono_ns(),
+        "wall_clock": datetime.now().astimezone().isoformat(),
+        "grams": grams,
+        "bird_id": bird_id,
+        "note": note,
+    }
+    path = session_dir / "reference_weights.jsonl"
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
+    return path
+
+
+def record_calibration(
+    cfg: RigConfig, grams: float, dwell_s: float = 5.0, note: str = ""
+) -> Path:
+    """Capture a calibration interval: hold `grams` steady on the platform for
+    `dwell_s` seconds (grams=0 for the empty plate). Appends the mono_ns window
+    to calibration.jsonl; offline compute_calibration turns empty + known-mass
+    windows into raw->grams and tracks gain drift."""
+    session_dir = _active_session_dir(cfg)
+    start = mono_ns()
+    time.sleep(max(0.0, dwell_s))
+    record = {
+        "start_mono_ns": start,
+        "end_mono_ns": mono_ns(),
+        "grams": grams,
+        "note": note,
+    }
+    path = session_dir / "calibration.jsonl"
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
+    return path
+
+
 def _spawn(module: str, args: list[str], stderr_path: Path) -> subprocess.Popen:
     # Detached (start_new_session): survives the CLI exiting, and gets reaped
     # by init when it dies. stderr goes to a file so crashes that happen
@@ -100,7 +153,21 @@ def _spawn(module: str, args: list[str], stderr_path: Path) -> subprocess.Popen:
         stderr_file.close()  # the child holds its own copy of the fd
 
 
-def start_session(cfg: RigConfig, note: str = "") -> Path:
+def _cycle_day(placement_date: str | None, session_date: datetime) -> int | None:
+    """Broiler cycle day (0 = placement) from an ISO placement date. The
+    expected bird mass follows the breed growth curve indexed by this."""
+    if not placement_date:
+        return None
+    try:
+        placed = datetime.fromisoformat(placement_date).date()
+    except ValueError:
+        return None
+    return (session_date.date() - placed).days
+
+
+def start_session(
+    cfg: RigConfig, note: str = "", deployment: dict[str, Any] | None = None
+) -> Path:
     root = cfg.data_root
     root.mkdir(parents=True, exist_ok=True)
     lock_path = root / LOCK_NAME
@@ -132,11 +199,17 @@ def start_session(cfg: RigConfig, note: str = "") -> Path:
         (session_dir / "video").mkdir()
         (session_dir / "logs").mkdir()
 
+        deployment = dict(deployment or {})
+        if "placement_date" in deployment:
+            deployment["cycle_day"] = _cycle_day(
+                deployment.get("placement_date"), wall
+            )
         meta = {
             "session_id": session_id,
             "wall_clock": wall.isoformat(),
             "mono_ns": mono,
             "note": note,
+            "deployment": deployment,
             "config": {
                 "port": cfg.port,
                 "baud": cfg.baud,
@@ -145,6 +218,9 @@ def start_session(cfg: RigConfig, note: str = "") -> Path:
                 "fps": cfg.fps,
                 "segment_ms": cfg.segment_ms,
                 "flush_interval_s": cfg.flush_interval_s,
+                "load_cell_capacity_g": cfg.load_cell_capacity_g,
+                "ads1232_gain": cfg.ads1232_gain,
+                "ads1232_rate_sps": cfg.ads1232_rate_sps,
                 "git_commit": _git_commit(),
                 "version": __version__,
             },

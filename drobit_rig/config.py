@@ -23,3 +23,8 @@ class RigConfig:
     flush_interval_s: float = 60.0
     # |raw - baseline| above this (raw ADC counts) is flagged by events.py.
     event_threshold: int = 2000
+    # -- device metrology (recorded in meta.json for reproducibility) ----------
+    load_cell_capacity_g: int | None = None
+    """Full-scale rating of the load cell in grams; sets the raw-count budget."""
+    ads1232_gain: int = 128
+    ads1232_rate_sps: int = 80

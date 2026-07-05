@@ -24,6 +24,9 @@ def _config_from_args(args: argparse.Namespace) -> RigConfig:
         segment_ms=args.segment_ms,
         flush_interval_s=args.flush_interval,
         event_threshold=args.threshold,
+        load_cell_capacity_g=args.load_cell_capacity,
+        ads1232_gain=args.ads_gain,
+        ads1232_rate_sps=args.ads_rate,
     )
 
 
@@ -45,10 +48,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--flush-interval", type=float, default=defaults.flush_interval_s)
     ap.add_argument("--threshold", type=int, default=defaults.event_threshold,
                     help="event detection threshold in raw ADC counts")
+    ap.add_argument("--load-cell-capacity", type=int, default=defaults.load_cell_capacity_g,
+                    metavar="G", help="load cell full-scale rating in grams")
+    ap.add_argument("--ads-gain", type=int, default=defaults.ads1232_gain)
+    ap.add_argument("--ads-rate", type=int, default=defaults.ads1232_rate_sps,
+                    metavar="SPS", help="ADS1232 output data rate")
 
     sub = ap.add_subparsers(dest="command", required=True)
     start_parser = sub.add_parser("start", help="start a new session")
     start_parser.add_argument("--note", default="", help="free-text note for meta.json")
+    # Deployment metadata: lets the analysis side compute cycle day / expected
+    # bird mass and stratify across the growth cycle.
+    start_parser.add_argument("--breed", default="", help="e.g. Ross 308, Cobb 500")
+    start_parser.add_argument("--placement-date", default="",
+                              help="flock placement date YYYY-MM-DD (day 0)")
+    start_parser.add_argument("--house", default="", help="house / barn id")
+    start_parser.add_argument("--pen", default="", help="pen / section id")
+    start_parser.add_argument("--bird-count", type=int, default=None,
+                              help="birds in the pen (density context)")
     sub.add_parser("stop", help="stop the running session")
     sub.add_parser("status", help="show session / disk status")
     events_parser = sub.add_parser(
@@ -56,13 +73,39 @@ def main(argv: list[str] | None = None) -> int:
     )
     events_parser.add_argument("session_dir", type=Path)
 
+    mw = sub.add_parser(
+        "mark-weight",
+        help="log a ground-truth reference weight into the running session",
+    )
+    mw.add_argument("--grams", type=float, required=True)
+    mw.add_argument("--bird-id", default="", help="which bird, if known")
+    mw.add_argument("--note", default="")
+
+    cal = sub.add_parser(
+        "calibrate",
+        help="record a calibration interval (hold known mass steady)",
+    )
+    cal.add_argument("--grams", type=float, required=True,
+                     help="known mass on the plate now (0 = empty)")
+    cal.add_argument("--dwell", type=float, default=5.0, help="seconds to hold")
+    cal.add_argument("--note", default="")
+
     args = ap.parse_args(argv)
     setup_logging("cli")
     cfg = _config_from_args(args)
 
     try:
         if args.command == "start":
-            session_dir = session.start_session(cfg, note=args.note)
+            deployment = {
+                "breed": args.breed,
+                "placement_date": args.placement_date,
+                "house": args.house,
+                "pen": args.pen,
+                "bird_count": args.bird_count,
+            }
+            session_dir = session.start_session(
+                cfg, note=args.note, deployment=deployment
+            )
             print(f"started: {session_dir}")
         elif args.command == "stop":
             session_dir = session.stop_session(cfg)
@@ -72,6 +115,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "events":
             n = events.scan_session(args.session_dir, threshold=cfg.event_threshold)
             print(f"{n} events -> {args.session_dir / 'events.jsonl'}")
+        elif args.command == "mark-weight":
+            path = session.mark_weight(
+                cfg, args.grams, note=args.note, bird_id=args.bird_id
+            )
+            print(f"logged {args.grams} g -> {path}")
+        elif args.command == "calibrate":
+            print(f"hold {args.grams} g steady for {args.dwell}s…")
+            path = session.record_calibration(
+                cfg, args.grams, dwell_s=args.dwell, note=args.note
+            )
+            print(f"calibration interval -> {path}")
     except session.SessionError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
