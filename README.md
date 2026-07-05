@@ -47,21 +47,34 @@ Optionally add the venv's bin to PATH, or symlink:
 ## Run
 
 ```bash
-drobit-rig start --note "hen #3, perch test"
-drobit-rig status        # samples, gaps, disk free, segment count
-drobit-rig stop          # flushes, writes end timestamps, runs event scan
+drobit-rig start --breed "Ross 308" --placement-date 2026-06-01 \
+                 --house H1 --pen P2 --bird-count 20000 --note "cycle day 35"
+drobit-rig status                       # samples, gaps, disk free, segment count
+drobit-rig mark-weight --grams 2450 --bird-id B7   # ground-truth reference weight
+drobit-rig calibrate --grams 0 --dwell 5           # empty plate (then a known mass)
+drobit-rig stop                         # flushes, writes end timestamps, event scan
 ```
 
 One session at a time (lock file `/data/sessions/current.json`). `start`
 spawns two detached workers — the scale reader and the video recorder — so
 you can log out; `stop` SIGTERMs them and waits for a clean flush.
 
+`mark-weight` and `calibrate` are run *during* a session: they timestamp into
+the running session (aligned to `scale.parquet` by `rpi_mono_ns`).
+`mark-weight` logs an independent scale reading — the truth the detector's
+estimates are bias-corrected against. `calibrate` records a hold of a known
+mass (`--grams 0` = empty) so the offline `compute_calibration` can derive
+raw→grams and track gain drift.
+
 Session directory layout:
 
 ```
 /data/sessions/20260704_143012_1783538212/
-├── meta.json           session id, wall↔monotonic bridge, config, git commit
+├── meta.json           session id, wall↔monotonic bridge, deployment, config
 ├── scale.parquet       session, seq, esp_us, rpi_mono_ns, raw   (80 Hz)
+├── temperature.jsonl   periodic ESP32 on-die temperature (raw), for drift
+├── reference_weights.jsonl  ground-truth weights from `mark-weight`
+├── calibration.jsonl   known-mass hold intervals from `calibrate`
 ├── gaps.jsonl          seq gaps and ESP resets
 ├── status.json         live counters (updated every 5 s)
 ├── video/seg_00000.h264 ...   5-min segments
@@ -70,6 +83,11 @@ Session directory layout:
 ├── logs/*.log          rotating logs per component
 └── done                present iff the session was stopped cleanly
 ```
+
+`meta.json` carries a `deployment` block (breed, placement date, computed
+`cycle_day`, house/pen, bird count) so the analysis side can index the breed
+growth curve and stratify across the cycle, plus device metrology in `config`
+(`load_cell_capacity_g`, `ads1232_gain`, `ads1232_rate_sps`).
 
 Tune with flags: `--fps`, `--width/--height`, `--segment-ms`, `--port`,
 `--baud`, `--flush-interval`, `--threshold` (event scan, raw ADC counts),
