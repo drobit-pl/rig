@@ -36,6 +36,16 @@ def test_encode_size_and_roundtrip():
     assert parser.crc_errors == 0
 
 
+def test_temp_frame_roundtrip():
+    frame = Frame(FrameType.TEMP, session=7, seq=5, esp_us=99999, raw=137)
+    wire = frame.encode()
+    assert len(wire) == FRAME_SIZE
+    assert wire[1] == 0x04  # type byte on the wire
+    parser = FrameParser()
+    assert list(parser.feed(wire)) == [frame]
+    assert parser.crc_errors == 0
+
+
 def test_valid_stream():
     frames = [sample(seq=i) for i in range(50)]
     stream = b"".join(f.encode() for f in frames)

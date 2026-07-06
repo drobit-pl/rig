@@ -36,6 +36,10 @@ class FrameType(enum.IntEnum):
     SAMPLE = 0x01
     PONG = 0x02
     STATUS = 0x03
+    TEMP = 0x04
+    """Periodic temperature reading; `raw` carries the sensor value (device-
+    specific units). Shares the seq space like every other frame; the reader
+    routes it to temperature.jsonl instead of scale.parquet."""
 
 
 _KNOWN_TYPES = frozenset(int(t) for t in FrameType)

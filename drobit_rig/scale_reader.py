@@ -146,6 +146,7 @@ class ScaleReader:
         self.resets = 0
         self.serial_reconnects = 0
         self.start_sends = 0
+        self.temp_frames = 0
 
     # -- serial ----------------------------------------------------------
 
@@ -344,8 +345,24 @@ class ScaleReader:
                 self._started = True
             sink.append(frame.session, frame.seq, frame.esp_us, now_ns, frame.raw)
             self.samples += 1
+        elif frame.type is protocol.FrameType.TEMP:
+            self._record_temperature(frame, now_ns)
+            self.temp_frames += 1
         else:
             _LOG.info("received %s frame (seq=%d)", frame.type.name, frame.seq)
+
+    def _record_temperature(self, frame: protocol.Frame, now_ns: int) -> None:
+        """Append one temperature reading to temperature.jsonl. TEMP frames are
+        rare (sub-Hz), so open/append/close per frame keeps it simple and
+        crash-safe. `raw` is the sensor's value in device-specific units."""
+        line = json.dumps({
+            "rpi_mono_ns": now_ns,
+            "esp_us": frame.esp_us,
+            "session": frame.session,
+            "raw": frame.raw,
+        })
+        with open(self._session_dir / "temperature.jsonl", "a") as temp_file:
+            temp_file.write(line + "\n")
 
     # -- status ------------------------------------------------------------
 
@@ -358,6 +375,7 @@ class ScaleReader:
             "missing_samples": self.missing_samples,
             "gap_events": self.gap_events,
             "resets": self.resets,
+            "temp_frames": self.temp_frames,
             "crc_errors": self._parser.crc_errors,
             "bytes_discarded": self._parser.bytes_discarded,
             "unknown_types": self._parser.unknown_types,
